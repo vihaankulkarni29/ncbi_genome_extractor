@@ -1,10 +1,11 @@
 # NCBI Genome Extractor
 
-A robust tool for downloading genome sequences as FASTA files from NCBI search queries, with comprehensive metadata extraction for antimicrobial resistance research. Designed for bioinformaticians and PhD scholars conducting research.
+A robust tool for downloading genome sequences as FASTA files from NCBI search queries, with **smart genome selection** and comprehensive metadata extraction optimized for antimicrobial resistance research. Designed for bioinformaticians and PhD scholars conducting research.
 
 ## Features
 
 - Download complete genome sequences from NCBI
+- **🎯 Smart genome selection**: Automatically selects highest-quality genomes based on metadata completeness
 - Handle large files efficiently with streaming downloads
 - Parse NCBI search URLs or custom queries
 - Batch download multiple genomes
@@ -45,12 +46,46 @@ python ncbi_genome_extractor.py --url "https://www.ncbi.nlm.nih.gov/nuccore/?ter
 python ncbi_genome_extractor.py --query "SARS-CoV-2 complete genome" --output_dir ./genomes
 ```
 
-**Limit the number of genomes (essential for large searches):**
+**Smart genome selection - get the BEST genomes with complete metadata:**
 ```bash
 python ncbi_genome_extractor.py --query "Escherichia coli AND complete genome" --max_results 10
 ```
 
 **Clean, simple commands - metadata is extracted automatically!**
+
+### 🎯 Smart Genome Selection
+
+**The tool automatically selects the BEST genomes based on metadata quality:**
+
+**Quality Scoring System (0-10 points):**
+- ✅ **MIC Data**: 3 points (most valuable for AMR research)
+- ✅ **BioSample ID**: 2 points
+- ✅ **BioProject ID**: 1 point
+- ✅ **Collection Date**: 1 point
+- ✅ **Geographic Data**: 1 point (country/isolation source)
+- ✅ **Host Information**: 1 point
+- ✅ **Antibiotic Resistance**: 1 point
+
+**How it works:**
+1. Searches for 5x more genomes than requested (e.g., 50 genomes for `--max_results 10`)
+2. Extracts metadata for all candidate genomes
+3. Scores each genome based on metadata completeness
+4. Selects the top N genomes with highest quality scores
+5. Downloads only the highest-quality genomes
+
+**Example Output:**
+```
+INFO - Evaluating 50 genomes for metadata quality...
+INFO - Selected 10 best genomes:
+INFO -   - High quality (score ≥7): 3
+INFO -   - Medium quality (score 4-6): 5
+INFO -   - Low quality (score <4): 2
+```
+
+**Disable smart selection (use first N results):**
+```bash
+python ncbi_genome_extractor.py --query "your query" --max_results 10 --no_quality_selection
+```
 
 ### Handling Large Searches
 
@@ -82,6 +117,9 @@ python ncbi_genome_extractor.py --query "your complex query" --max_results 100
 **Essential for large searches:**
 - `--max_results`: **Maximum number of genomes to download** (default: 100) - **CRITICAL** for controlling download size
 - `--output_dir`: Directory to save FASTA files and metadata (default: ./output)
+
+**Smart selection options:**
+- `--no_quality_selection`: Disable quality-based genome selection (use first N results instead of best N)
 
 **Metadata options:**
 - `--metadata_format`: Format for metadata output (json or csv, default: json)

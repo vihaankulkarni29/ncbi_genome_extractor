@@ -36,12 +36,20 @@ class NCBIExtractor:
             'User-Agent': f'NCBIExtractor/1.0 (mailto:{self.email})'
         })
 
-    def search_genomes(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> List[str]:
+    def search_genomes(self, query: str, max_results: int = DEFAULT_MAX_RESULTS,
+                      select_best: bool = True) -> List[str]:
         """Search NCBI for genome IDs matching the query"""
+        if select_best:
+            # Get more genomes initially to select the best ones
+            initial_results = max_results * 5  # Get 5x more to have good selection
+            initial_results = min(initial_results, 500)  # Cap at 500 to avoid API limits
+        else:
+            initial_results = max_results
+
         params = {
             'db': 'nuccore',
             'term': query,
-            'retmax': max_results,
+            'retmax': initial_results,
             'retmode': 'xml',
             'email': self.email,
             'api_key': self.api_key if self.api_key else None
@@ -59,6 +67,10 @@ class NCBIExtractor:
         ids = []
         for id_element in root.findall('.//Id'):
             ids.append(id_element.text)
+
+        if select_best and len(ids) > max_results:
+            # Select the best genomes based on metadata quality
+            ids = self._select_best_genomes(ids, max_results)
 
         return ids
 
@@ -193,6 +205,76 @@ class NCBIExtractor:
             return [self._create_empty_metadata(gid) for gid in genome_ids]
 
         return metadata_list
+
+    def _select_best_genomes(self, genome_ids: List[str], max_results: int) -> List[str]:
+        """Select the best genomes based on metadata quality"""
+        logging.info(f"Evaluating {len(genome_ids)} genomes for metadata quality...")
+
+        # Extract metadata for all genomes
+        metadata_list = self.extract_metadata(genome_ids)
+
+        # Score each genome based on metadata completeness
+        scored_genomes = []
+        for metadata in metadata_list:
+            score = self._calculate_metadata_score(metadata)
+            scored_genomes.append({
+                'genome_id': metadata['genome_id'],
+                'score': score,
+                'metadata': metadata
+            })
+
+        # Sort by score (highest first) and select top genomes
+        scored_genomes.sort(key=lambda x: x['score'], reverse=True)
+        selected_genomes = scored_genomes[:max_results]
+
+        selected_ids = [genome['genome_id'] for genome in selected_genomes]
+
+        # Log selection results
+        high_quality = sum(1 for genome in selected_genomes if genome['score'] >= 7)
+        medium_quality = sum(1 for genome in selected_genomes if 4 <= genome['score'] < 7)
+        low_quality = sum(1 for genome in selected_genomes if genome['score'] < 4)
+
+        logging.info(f"Selected {len(selected_ids)} best genomes:")
+        logging.info(f"  - High quality (score ≥7): {high_quality}")
+        logging.info(f"  - Medium quality (score 4-6): {medium_quality}")
+        logging.info(f"  - Low quality (score <4): {low_quality}")
+
+        return selected_ids
+
+    def _calculate_metadata_score(self, metadata: Dict[str, Any]) -> int:
+        """Calculate a quality score for genome metadata (0-10 scale)"""
+        score = 0
+
+        # MIC data (most important for AMR research) - 3 points
+        if metadata.get('mic_data') and len(metadata['mic_data']) > 0:
+            mic_count = len(metadata['mic_data'])
+            score += min(mic_count * 2, 3)  # Max 3 points for MIC data
+
+        # BioSample data - 2 points
+        if metadata.get('biosample'):
+            score += 2
+
+        # BioProject data - 1 point
+        if metadata.get('bioproject'):
+            score += 1
+
+        # Collection date - 1 point
+        if metadata.get('collection_date'):
+            score += 1
+
+        # Geographic data (country/isolation source) - 1 point
+        if metadata.get('country') or metadata.get('isolation_source'):
+            score += 1
+
+        # Host information - 1 point
+        if metadata.get('host'):
+            score += 1
+
+        # Antibiotic resistance data - 1 point
+        if metadata.get('antibiotic_resistance') and len(metadata['antibiotic_resistance']) > 0:
+            score += 1
+
+        return min(score, 10)  # Cap at 10
 
     def _parse_docsum_metadata(self, docsum: ET.Element) -> Dict[str, Any]:
         """Parse metadata from NCBI DocSum XML"""
@@ -471,6 +553,8 @@ def main():
                        help='Format for metadata output (default: json)')
     parser.add_argument('--no_metadata', action='store_true',
                        help='Skip metadata extraction (not recommended for AMR research)')
+    parser.add_argument('--no_quality_selection', action='store_true',
+                       help='Disable quality-based genome selection (use first N results)')
 
     args = parser.parse_args()
 
@@ -499,7 +583,8 @@ def main():
     logging.info(f"Searching for genomes with query: {query}")
 
     # Search for genomes
-    genome_ids = extractor.search_genomes(query, args.max_results)
+    select_best = not args.no_quality_selection
+    genome_ids = extractor.search_genomes(query, args.max_results, select_best)
     if not genome_ids:
         logging.warning("No genomes found for the query")
         sys.exit(0)
