@@ -14,3 +14,7 @@ DEFAULT_OUTPUT_DIR = "./output"
 NCBI_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 NCBI_SEARCH_URL = NCBI_BASE_URL + "esearch.fcgi"
 NCBI_FETCH_URL = NCBI_BASE_URL + "efetch.fcgi"
+
+# BV-BRC API settings
+BV_BRC_BASE_URL = "https://www.bv-brc.org/api"
+BV_BRC_API_KEY = None  # Set this if you have a BV-BRC API key
