@@ -75,9 +75,15 @@ class NCBIExtractor:
         return ids
 
     def download_fasta(self, genome_id: str, output_dir: str = DEFAULT_OUTPUT_DIR,
-                      retries: int = DEFAULT_RETRIES) -> bool:
+                      retries: int = DEFAULT_RETRIES, accession: Optional[str] = None) -> tuple[bool, str]:
         """Download FASTA sequence for a single genome ID"""
         os.makedirs(output_dir, exist_ok=True)
+
+        # Get accession number if not provided
+        if not accession:
+            accession = self._get_accession_from_id(genome_id)
+            if not accession:
+                accession = genome_id  # Fallback to genome_id if accession not found
 
         params = {
             'db': 'nuccore',
@@ -96,13 +102,13 @@ class NCBIExtractor:
                 if not response:
                     continue
 
-                filename = f"{genome_id}.fasta"
+                filename = f"{accession}.fasta"
                 filepath = os.path.join(output_dir, filename)
 
                 # Download with progress bar for large files
                 total_size = int(response.headers.get('content-length', 0))
                 with open(filepath, 'wb') as f, tqdm(
-                    desc=f"Downloading {genome_id}",
+                    desc=f"Downloading {accession}",
                     total=total_size,
                     unit='B',
                     unit_scale=True,
@@ -113,16 +119,44 @@ class NCBIExtractor:
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-                logging.info(f"Successfully downloaded {genome_id}")
-                return True
+                logging.info(f"Successfully downloaded {accession}")
+                return True, accession
 
             except Exception as e:
-                logging.warning(f"Attempt {attempt + 1} failed for {genome_id}: {e}")
+                logging.warning(f"Attempt {attempt + 1} failed for {accession}: {e}")
                 if attempt < retries:
                     time.sleep(DEFAULT_DELAY * (2 ** attempt))  # Exponential backoff
 
-        logging.error(f"Failed to download {genome_id} after {retries + 1} attempts")
-        return False
+        logging.error(f"Failed to download {accession} after {retries + 1} attempts")
+        return False, accession
+
+    def _get_accession_from_id(self, genome_id: str) -> Optional[str]:
+        """Get accession number from genome ID"""
+        try:
+            summary_url = NCBI_BASE_URL + "esummary.fcgi"
+            params = {
+                'db': 'nuccore',
+                'id': genome_id,
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(summary_url, params)
+
+            if response:
+                root = ET.fromstring(response.text)
+                docsum = root.find('.//DocSum')
+                if docsum is not None:
+                    for item in docsum.findall('Item'):
+                        if item.get('Name') == 'Caption':
+                            return item.text
+
+        except Exception as e:
+            logging.warning(f"Failed to get accession for {genome_id}: {e}")
+
+        return None
 
     def download_multiple_genomes(self, genome_ids: List[str], output_dir: str = DEFAULT_OUTPUT_DIR,
                                 max_concurrent: int = 3) -> List[str]:
@@ -130,12 +164,20 @@ class NCBIExtractor:
         successful = []
         failed = []
 
+        # Get accession numbers for all genomes first
+        logging.info("Retrieving accession numbers for all genomes...")
+        genome_accessions = {}
+        for genome_id in genome_ids:
+            accession = self._get_accession_from_id(genome_id)
+            genome_accessions[genome_id] = accession or genome_id
+
         with tqdm(total=len(genome_ids), desc="Overall Progress") as pbar:
             for genome_id in genome_ids:
-                if self.download_fasta(genome_id, output_dir):
-                    successful.append(genome_id)
+                success, accession = self.download_fasta(genome_id, output_dir, accession=genome_accessions[genome_id])
+                if success:
+                    successful.append(accession)
                 else:
-                    failed.append(genome_id)
+                    failed.append(accession)
                 pbar.update(1)
 
         logging.info(f"Downloaded {len(successful)} genomes successfully")
@@ -323,7 +365,14 @@ class NCBIExtractor:
         # Try to get additional metadata from BioSample if available
         if metadata['biosample']:
             biosample_metadata = self._get_biosample_metadata(metadata['biosample'])
-            metadata.update(biosample_metadata)
+            if biosample_metadata:
+                # Only update if we got actual data
+                for key, value in biosample_metadata.items():
+                    if value and (key not in metadata or not metadata[key]):
+                        metadata[key] = value
+
+        # Enhanced metadata validation and enrichment
+        metadata = self._enhance_metadata_quality(metadata)
 
         return metadata
 
@@ -395,65 +444,85 @@ class NCBIExtractor:
         try:
             root = ET.fromstring(xml_content)
 
-            # Extract collection date
-            collection_date = root.find('.//Attribute[@attribute_name="collection_date"]')
-            if collection_date is not None:
-                metadata['collection_date'] = collection_date.text
+            # Extract collection date (try multiple attribute names)
+            for attr_name in ['collection_date', 'collection date', 'date']:
+                collection_date = root.find(f'.//Attribute[@attribute_name="{attr_name}"]')
+                if collection_date is not None and collection_date.text:
+                    metadata['collection_date'] = collection_date.text
+                    break
 
-            # Extract country
-            country = root.find('.//Attribute[@attribute_name="geo_loc_name"]')
-            if country is not None:
-                metadata['country'] = country.text
+            # Extract country/geographic location (try multiple attribute names)
+            for attr_name in ['geo_loc_name', 'geographic location', 'country', 'location']:
+                country = root.find(f'.//Attribute[@attribute_name="{attr_name}"]')
+                if country is not None and country.text:
+                    metadata['country'] = country.text
+                    break
 
-            # Extract host
-            host = root.find('.//Attribute[@attribute_name="host"]')
-            if host is not None:
-                metadata['host'] = host.text
+            # Extract host (try multiple attribute names)
+            for attr_name in ['host', 'host organism', 'source host']:
+                host = root.find(f'.//Attribute[@attribute_name="{attr_name}"]')
+                if host is not None and host.text:
+                    metadata['host'] = host.text
+                    break
 
-            # Extract isolation source
-            isolation = root.find('.//Attribute[@attribute_name="isolation_source"]')
-            if isolation is not None:
-                metadata['isolation_source'] = isolation.text
+            # Extract isolation source (try multiple attribute names)
+            for attr_name in ['isolation_source', 'isolation source', 'source', 'sample type']:
+                isolation = root.find(f'.//Attribute[@attribute_name="{attr_name}"]')
+                if isolation is not None and isolation.text:
+                    metadata['isolation_source'] = isolation.text
+                    break
 
-            # Extract MIC data and resistance information
-            mic_data = []
-            resistance_phenotype = []
-            antibiotic_resistance = []
-
+            # Extract additional metadata from structured attributes
             for attr in root.findall('.//Attribute'):
                 attr_name = attr.get('attribute_name', '').lower()
                 attr_value = attr.text or ''
 
-                # MIC data patterns
-                if 'mic' in attr_name or 'minimum inhibitory concentration' in attr_name:
-                    mic_data.append({
-                        'antibiotic': attr_name.replace('mic', '').replace('_', ' ').strip(),
+                if not attr_value.strip():
+                    continue
+
+                # MIC data patterns (expanded)
+                if any(keyword in attr_name for keyword in ['mic', 'minimum inhibitory concentration', 'mic_', 'mic50', 'mic90']):
+                    antibiotic_name = attr_name.replace('mic', '').replace('minimum inhibitory concentration', '').replace('_', ' ').strip()
+                    if not antibiotic_name:
+                        antibiotic_name = 'unknown'
+                    mic_data_entry = {
+                        'antibiotic': antibiotic_name,
                         'value': attr_value,
                         'unit': self._extract_mic_unit(attr_value)
-                    })
+                    }
+                    if 'mic_data' not in metadata:
+                        metadata['mic_data'] = []
+                    metadata['mic_data'].append(mic_data_entry)
 
-                # Resistance phenotype
-                elif 'resistance' in attr_name or 'phenotype' in attr_name:
-                    resistance_phenotype.append(attr_value)
+                # Resistance phenotype (expanded)
+                elif any(keyword in attr_name for keyword in ['resistance', 'phenotype', 'susceptibility', 'antibiotic resistance']):
+                    if 'resistance_phenotype' not in metadata:
+                        metadata['resistance_phenotype'] = []
+                    metadata['resistance_phenotype'].append(attr_value)
 
-                # Specific antibiotic resistance
-                elif any(abx in attr_name for abx in ['ampicillin', 'tetracycline', 'ciprofloxacin',
-                                                    'gentamicin', 'trimethoprim', 'sulfamethoxazole',
-                                                    'cefotaxime', 'ceftriaxone', 'meropenem', 'amikacin']):
-                    antibiotic_resistance.append({
+                # Specific antibiotic resistance (expanded list)
+                elif any(abx in attr_name for abx in [
+                    'ampicillin', 'tetracycline', 'ciprofloxacin', 'gentamicin', 'trimethoprim',
+                    'sulfamethoxazole', 'cefotaxime', 'ceftriaxone', 'meropenem', 'amikacin',
+                    'azithromycin', 'clindamycin', 'erythromycin', 'vancomycin', 'linezolid',
+                    'daptomycin', 'colistin', 'polymyxin', 'carbapenem', 'esbl', 'mrsa'
+                ]):
+                    resistance_entry = {
                         'antibiotic': attr_name,
                         'resistance': attr_value
-                    })
+                    }
+                    if 'antibiotic_resistance' not in metadata:
+                        metadata['antibiotic_resistance'] = []
+                    metadata['antibiotic_resistance'].append(resistance_entry)
 
-            if mic_data:
-                metadata['mic_data'] = mic_data
-            if resistance_phenotype:
-                metadata['resistance_phenotype'] = resistance_phenotype
-            if antibiotic_resistance:
-                metadata['antibiotic_resistance'] = antibiotic_resistance
+                # Additional useful metadata
+                elif attr_name in ['strain', 'serotype', 'serovar', 'pathotype', 'virulence']:
+                    metadata[attr_name] = attr_value
 
         except ET.ParseError as e:
             logging.warning(f"Failed to parse BioSample XML: {e}")
+        except Exception as e:
+            logging.warning(f"Error parsing BioSample metadata: {e}")
 
         return metadata
 
@@ -465,6 +534,50 @@ class NCBIExtractor:
             if unit in mic_value.lower():
                 return unit
         return 'unknown'
+
+    def _enhance_metadata_quality(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Enhance and validate metadata quality"""
+        # Try to extract additional information from title if missing
+        if metadata.get('title') and not metadata.get('organism'):
+            temp_metadata = metadata.copy()
+            self._extract_organism_from_title(temp_metadata, metadata['title'])
+            for key in ['organism', 'genus', 'species']:
+                if temp_metadata.get(key) and not metadata.get(key):
+                    metadata[key] = temp_metadata[key]
+
+        # Validate and clean collection date
+        if metadata.get('collection_date'):
+            metadata['collection_date'] = self._normalize_date(metadata['collection_date'])
+
+        # Ensure lists are properly initialized
+        for list_field in ['mic_data', 'resistance_phenotype', 'antibiotic_resistance']:
+            if list_field not in metadata:
+                metadata[list_field] = []
+            elif not isinstance(metadata[list_field], list):
+                metadata[list_field] = [metadata[list_field]]
+
+        # Add metadata quality score
+        metadata['quality_score'] = self._calculate_metadata_score(metadata)
+
+        return metadata
+
+    def _normalize_date(self, date_str: str) -> str:
+        """Normalize date strings to consistent format"""
+        if not date_str:
+            return date_str
+
+        # Try to parse various date formats
+        try:
+            # Handle YYYY-MM-DD, YYYY/MM/DD, etc.
+            if '-' in date_str or '/' in date_str:
+                return date_str.strip()
+            # Handle just year
+            elif len(date_str) == 4 and date_str.isdigit():
+                return f"{date_str}-01-01"
+            else:
+                return date_str.strip()
+        except:
+            return date_str.strip()
 
     def _create_empty_metadata(self, genome_id: str) -> Dict[str, Any]:
         """Create empty metadata structure for failed extractions"""
@@ -483,7 +596,8 @@ class NCBIExtractor:
             'isolation_source': None,
             'mic_data': [],
             'resistance_phenotype': [],
-            'antibiotic_resistance': []
+            'antibiotic_resistance': [],
+            'quality_score': 0
         }
 
     def save_metadata_to_json(self, metadata_list: List[Dict[str, Any]], output_file: str):
