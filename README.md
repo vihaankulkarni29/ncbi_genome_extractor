@@ -1,19 +1,20 @@
-# NCBI Genome Extractor
+# Federated Genome Harvester
 
-A robust tool for downloading genome sequences as FASTA files from NCBI search queries, with **smart genome selection** and comprehensive metadata extraction optimized for antimicrobial resistance research. Designed for bioinformaticians and PhD scholars conducting research.
+A robust, multi-database tool for downloading genome sequences as FASTA files with **smart genome selection** and comprehensive metadata extraction. Supports antimicrobial resistance research and general genomic studies across NCBI, BV-BRC, EnteroBase, and PATRIC databases. Designed for bioinformaticians and researchers worldwide.
 
 ## Features
 
-- Download complete genome sequences from NCBI
+- **Multi-database genome retrieval**: Search across NCBI, BV-BRC, EnteroBase, and PATRIC
 - **🎯 Smart genome selection**: Automatically selects highest-quality genomes based on metadata completeness
+- **Quality filtering**: Configurable quality thresholds ensure only valuable genomes are downloaded
 - Handle large files efficiently with streaming downloads
-- Parse NCBI search URLs or custom queries
-- Batch download multiple genomes
+- Parse search URLs or custom queries from any supported database
+- Batch download multiple genomes with progress tracking
 - **Extract comprehensive metadata** including BioSample IDs, BioProject IDs, collection dates, organism information, and MIC data
-- Export metadata in JSON or CSV formats for downstream AMR analysis
+- Export metadata in JSON or CSV formats for downstream analysis
 - Robust error handling and automatic retries
-- Progress tracking and logging
 - Command-line interface optimized for bioinformatics workflows
+- **AMR-focused**: Special support for antimicrobial resistance research
 
 ## Installation
 
@@ -48,7 +49,7 @@ python ncbi_genome_extractor.py --query "SARS-CoV-2 complete genome" --output_di
 
 **Smart genome selection - get the BEST genomes with complete metadata:**
 ```bash
-python ncbi_genome_extractor.py --query "Escherichia coli AND complete genome" --max_results 10
+python ncbi_genome_extractor.py --query "Escherichia coli[Organism] AND complete genome" --max_results 10
 ```
 
 **Clean, simple commands - metadata is extracted automatically!**

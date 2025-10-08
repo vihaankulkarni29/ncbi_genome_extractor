@@ -24,6 +24,10 @@ def harmonize_data(raw_records: List[Dict[str, Any]], source: str) -> List[Dict[
             harmonized_record = _harmonize_ncbi_record(record)
         elif source == 'bvbrc':
             harmonized_record = _harmonize_bvbrc_record(record)
+        elif source == 'enterobase':
+            harmonized_record = _harmonize_enterobase_record(record)
+        elif source == 'patric':
+            harmonized_record = _harmonize_patric_record(record)
         else:
             raise ValueError(f"Unknown source: {source}")
 
@@ -116,6 +120,124 @@ def _extract_amr_phenotypes(record: Dict[str, Any]) -> List[str]:
         for resistance in record['antibiotic_resistance']:
             if isinstance(resistance, dict) and resistance.get('antibiotic'):
                 phenotypes.append(f"{resistance['antibiotic']}: {resistance.get('resistance', 'resistant')}")
+
+    return phenotypes
+
+
+def _harmonize_enterobase_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Harmonize EnteroBase record to standard schema"""
+    harmonized = {
+        'accession': record.get('accession', ''),
+        'organism': record.get('organism', 'Escherichia coli'),
+        'strain': record.get('strain', ''),
+        'collection_date': record.get('collection_date', ''),
+        'country': record.get('country', ''),
+        'host': record.get('host', ''),
+        'isolation_source': record.get('isolation_source', ''),
+        'amr_phenotypes': _extract_enterobase_amr_phenotypes(record)
+    }
+
+    # Add EnteroBase-specific fields
+    if record.get('serotype'):
+        harmonized['serotype'] = record['serotype']
+    if record.get('mlst_st'):
+        harmonized['mlst_st'] = record['mlst_st']
+    if record.get('quality_score'):
+        harmonized['quality_score'] = record['quality_score']
+
+    # Clean up empty strings
+    for key, value in harmonized.items():
+        if isinstance(value, str) and not value.strip():
+            harmonized[key] = None
+        elif isinstance(value, list) and not value:
+            harmonized[key] = []
+
+    return harmonized
+
+
+def _harmonize_patric_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Harmonize PATRIC record to standard schema"""
+    harmonized = {
+        'accession': record.get('accession', record.get('genome_id', '')),
+        'organism': record.get('organism', ''),
+        'strain': record.get('strain', ''),
+        'collection_date': record.get('collection_date', ''),
+        'country': record.get('country', ''),
+        'host': record.get('host', ''),
+        'isolation_source': record.get('isolation_source', ''),
+        'amr_phenotypes': _extract_patric_amr_phenotypes(record)
+    }
+
+    # Add PATRIC-specific fields
+    if record.get('mlst_st'):
+        harmonized['mlst_st'] = record['mlst_st']
+    if record.get('genome_length'):
+        harmonized['genome_length'] = record['genome_length']
+    if record.get('quality_score'):
+        harmonized['quality_score'] = record['quality_score']
+
+    # Clean up empty strings
+    for key, value in harmonized.items():
+        if isinstance(value, str) and not value.strip():
+            harmonized[key] = None
+        elif isinstance(value, list) and not value:
+            harmonized[key] = []
+
+    return harmonized
+
+
+def _extract_enterobase_amr_phenotypes(record: Dict[str, Any]) -> List[str]:
+    """Extract AMR phenotypes from EnteroBase record"""
+    phenotypes = []
+
+    # EnteroBase has rich AMR data
+    if record.get('resistance_phenotype'):
+        phenotypes.extend(record['resistance_phenotype'])
+
+    # Add MIC-based phenotypes
+    if record.get('mic_data'):
+        for mic_entry in record['mic_data']:
+            antibiotic = mic_entry.get('antibiotic', '')
+            value = mic_entry.get('value', '')
+            if antibiotic and value:
+                phenotypes.append(f"{antibiotic} MIC: {value}")
+
+    # Add antibiotic resistance entries
+    if record.get('antibiotic_resistance'):
+        for resistance in record['antibiotic_resistance']:
+            if isinstance(resistance, dict):
+                antibiotic = resistance.get('antibiotic', '')
+                res_type = resistance.get('resistance', '')
+                if antibiotic and res_type:
+                    phenotypes.append(f"{antibiotic}: {res_type}")
+            elif isinstance(resistance, str):
+                phenotypes.append(resistance)
+
+    return phenotypes
+
+
+def _extract_patric_amr_phenotypes(record: Dict[str, Any]) -> List[str]:
+    """Extract AMR phenotypes from PATRIC record"""
+    phenotypes = []
+
+    # PATRIC AMR data structure
+    if record.get('antibiotic_resistance'):
+        for resistance in record['antibiotic_resistance']:
+            if isinstance(resistance, dict):
+                antibiotic = resistance.get('antibiotic', '')
+                res_type = resistance.get('resistance', '')
+                if antibiotic and res_type:
+                    phenotypes.append(f"{antibiotic}: {res_type}")
+            elif isinstance(resistance, str):
+                phenotypes.append(resistance)
+
+    # Add MIC data if available
+    if record.get('mic_data'):
+        for mic_entry in record['mic_data']:
+            antibiotic = mic_entry.get('antibiotic', '')
+            value = mic_entry.get('value', '')
+            if antibiotic and value:
+                phenotypes.append(f"{antibiotic} MIC: {value}")
 
     return phenotypes
 

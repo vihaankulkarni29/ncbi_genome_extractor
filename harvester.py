@@ -19,28 +19,38 @@ from config import DEFAULT_OUTPUT_DIR
 def main():
     """Main CLI function"""
     parser = argparse.ArgumentParser(
-        description="Federated Genome Harvester - Multi-source genome data retrieval",
+        description="Federated Genome Harvester - Multi-database genome data retrieval with quality filtering",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Search ALL databases (default behavior)
-  python harvester.py --query "Escherichia coli" --max_results 25
+  # GENERAL GENOME SEARCH - Any organism, any region
+  python harvester.py --query "Escherichia coli" --max_results 50 --min_quality_score 3
 
-  # Search specific database
-  python harvester.py --source ncbi --query "Escherichia coli[Organism]" --max_results 10
-  python harvester.py --source bvbrc --query "Escherichia coli" --max_results 10
+  # STRICT QUALITY FILTERING - Only high-quality genomes with AMR data
+  python harvester.py --query "Klebsiella pneumoniae AND carbapenem" --require_amr_data --require_location --min_quality_score 5
+
+  # Search specific AMR-focused databases
+  python harvester.py --source enterobase --query "Salmonella enterica" --max_results 25
+  python harvester.py --source patric --query "Acinetobacter baumannii" --max_results 25
+
+  # Search traditional databases
+  python harvester.py --source ncbi --query "SARS-CoV-2[Organism]" --max_results 10
+  python harvester.py --source bvbrc --query "Pseudomonas aeruginosa" --max_results 10
 
   # Download specific genomes from any source
   python harvester.py --query "CP186630,NZ_CP064825" --download_only
 
-  # Full workflow: search all + download
-  python harvester.py --query "Klebsiella pneumoniae" --max_results 20 --download --metadata_format csv
+  # Geographic research - any region
+  python harvester.py --query "Escherichia coli AND Europe" --max_results 100 --download --metadata_format csv --min_quality_score 4
+
+  # AMR surveillance - any pathogen
+  python harvester.py --query "Staphylococcus aureus AND MRSA" --require_amr_data --max_results 50
         """
     )
 
-    parser.add_argument('--source', choices=['ncbi', 'bvbrc', 'all'],
+    parser.add_argument('--source', choices=['ncbi', 'bvbrc', 'enterobase', 'patric', 'all'],
                        default='all',
-                       help='Data source to query (ncbi, bvbrc, or all for both, default: all)')
+                       help='Data source to query (ncbi, bvbrc, enterobase, patric, or all for all sources, default: all)')
     parser.add_argument('--query', help='Search query for the selected source')
     parser.add_argument('--max_results', type=int, default=100,
                        help='Maximum number of results to return (default: 100)')
@@ -51,7 +61,13 @@ Examples:
     parser.add_argument('--download_only', action='store_true',
                        help='Only download FASTA sequences (skip metadata extraction)')
     parser.add_argument('--metadata_format', choices=['json', 'csv'], default='json',
-                       help='Format for metadata output (default: json)')
+                        help='Format for metadata output (default: json)')
+    parser.add_argument('--min_quality_score', type=int, default=0,
+                        help='Minimum quality score for genome inclusion (0-10, default: 0)')
+    parser.add_argument('--require_amr_data', action='store_true',
+                        help='Only download genomes with AMR resistance data')
+    parser.add_argument('--require_location', action='store_true',
+                        help='Only download genomes with geographic location data')
     parser.add_argument('--log_level', default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Logging level')
@@ -70,7 +86,7 @@ Examples:
 
     # Determine which sources to search
     if args.source == 'all':
-        sources = ['ncbi', 'bvbrc']
+        sources = ['ncbi', 'bvbrc', 'enterobase', 'patric']
     else:
         sources = [args.source]
 
@@ -114,6 +130,24 @@ Examples:
                             if result:
                                 successful.append(genome_id)
                                 break
+                    elif source == 'enterobase':
+                        from clients.enterobase_client import EnteroBaseClient
+                        client = EnteroBaseClient()
+                        result = client.download_fasta(genome_id, args.output_dir)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            success, accession = result
+                            if success:
+                                successful.append(accession)
+                                break
+                    elif source == 'patric':
+                        from clients.patric_client import PATRICClient
+                        client = PATRICClient()
+                        result = client.download_fasta(genome_id, args.output_dir)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            success, accession = result
+                            if success:
+                                successful.append(accession)
+                                break
 
             logging.info(f"Downloaded {len(successful)} genomes successfully")
 
@@ -128,6 +162,12 @@ Examples:
                     client = NCBIClient()
                 elif source == 'bvbrc':
                     client = BVBRCClient()
+                elif source == 'enterobase':
+                    from clients.enterobase_client import EnteroBaseClient
+                    client = EnteroBaseClient()
+                elif source == 'patric':
+                    from clients.patric_client import PATRICClient
+                    client = PATRICClient()
 
                 if client is None:
                     logging.error(f"Unknown source: {source}")
@@ -165,9 +205,55 @@ Examples:
 
             logging.info(f"Metadata saved to {metadata_path}")
 
+            # Apply quality filtering
+            filtered_records = []
+            for record in all_harmonized_records:
+                quality_score = record.get('quality_score', 0)
+
+                # Check minimum quality score
+                if quality_score < args.min_quality_score:
+                    continue
+
+                # Check AMR data requirement
+                if args.require_amr_data:
+                    amr_phenotypes = record.get('amr_phenotypes', [])
+                    mic_data = record.get('mic_data', [])
+                    antibiotic_resistance = record.get('antibiotic_resistance', [])
+                    if not (amr_phenotypes or mic_data or antibiotic_resistance):
+                        continue
+
+                # Check location requirement
+                if args.require_location:
+                    country = record.get('country')
+                    if not country:
+                        continue
+
+                filtered_records.append(record)
+
+            logging.info(f"After quality filtering: {len(filtered_records)}/{len(all_harmonized_records)} genomes meet criteria")
+
+            if not filtered_records:
+                logging.warning("No genomes met the quality criteria. Try lowering requirements.")
+                return
+
+            # Update harmonized records to filtered set
+            all_harmonized_records = filtered_records
+
+            # Save filtered metadata
+            metadata_file = f"{source_name}_filtered_harmonized_metadata.{args.metadata_format}"
+            metadata_path = os.path.join(args.output_dir, metadata_file)
+
+            if args.metadata_format == 'json':
+                with open(metadata_path, 'w', encoding='utf-8') as f:
+                    json.dump(all_harmonized_records, f, indent=2, ensure_ascii=False)
+            else:
+                save_metadata_to_csv(all_harmonized_records, metadata_path)
+
+            logging.info(f"Filtered metadata saved to {metadata_path}")
+
             # Download FASTA sequences if requested
             if args.download:
-                logging.info("Downloading FASTA sequences...")
+                logging.info("Downloading FASTA sequences for quality-filtered genomes...")
                 successful = []
 
                 for record in all_harmonized_records:
@@ -194,8 +280,24 @@ Examples:
                             else:
                                 if result:
                                     successful.append(accession)
+                        elif database == 'enterobase':
+                            from clients.enterobase_client import EnteroBaseClient
+                            client = EnteroBaseClient()
+                            result = client.download_fasta(accession, args.output_dir)
+                            if isinstance(result, tuple) and len(result) == 2:
+                                success, final_accession = result
+                                if success:
+                                    successful.append(final_accession)
+                        elif database == 'patric':
+                            from clients.patric_client import PATRICClient
+                            client = PATRICClient()
+                            result = client.download_fasta(accession, args.output_dir)
+                            if isinstance(result, tuple) and len(result) == 2:
+                                success, final_accession = result
+                                if success:
+                                    successful.append(final_accession)
 
-                logging.info(f"Downloaded {len(successful)} FASTA sequences")
+                logging.info(f"Downloaded {len(successful)} high-quality FASTA sequences")
 
             # Print summary
             print_summary(all_harmonized_records, args.source)
@@ -239,7 +341,7 @@ def print_summary(records: List[Dict[str, Any]], source: str):
         return
 
     print(f"\n{'='*50}")
-    print(f"📊 {source.upper()} Genome Harvest Summary")
+    print(f"Genome Harvest Summary - {source.upper()}")
     print(f"{'='*50}")
 
     total_genomes = len(records)
