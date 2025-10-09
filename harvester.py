@@ -8,12 +8,141 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from clients.ncbi_client import NCBIClient
 from clients.bvbrc_client import BVBRCClient
 from harmonizer import harmonize_data
 from config import DEFAULT_OUTPUT_DIR
+
+
+def download_genome_parallel(accession: str, database: str, output_dir: str, sources: List[str]) -> tuple:
+    """Download a single genome - designed for parallel execution"""
+    try:
+        if database.lower() == 'ncbi' and 'ncbi' in sources:
+            client = NCBIClient()
+            result = client.download_fasta(accession, output_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                success, final_accession = result
+                if success:
+                    return True, final_accession, None
+                else:
+                    return False, accession, "Download failed"
+            else:
+                if result:
+                    return True, accession, None
+                else:
+                    return False, accession, "Download failed"
+        
+        elif database.lower() == 'bvbrc' and 'bvbrc' in sources:
+            client = BVBRCClient()
+            result = client.download_fasta(accession, output_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                success, final_accession = result
+                if success:
+                    return True, final_accession, None
+                else:
+                    return False, accession, "Download failed"
+            else:
+                if result:
+                    return True, accession, None
+                else:
+                    return False, accession, "Download failed"
+        
+        elif database.lower() == 'enterobase' and 'enterobase' in sources:
+            from clients.enterobase_client import EnteroBaseClient
+            client = EnteroBaseClient()
+            result = client.download_fasta(accession, output_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                success, final_accession = result
+                if success:
+                    return True, final_accession, None
+                else:
+                    return False, accession, "Download failed"
+            else:
+                if result:
+                    return True, accession, None
+                else:
+                    return False, accession, "Download failed"
+        
+        elif database.lower() == 'patric' and 'patric' in sources:
+            from clients.patric_client import PATRICClient
+            client = PATRICClient()
+            result = client.download_fasta(accession, output_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                success, final_accession = result
+                if success:
+                    return True, final_accession, None
+                else:
+                    return False, accession, "Download failed"
+            else:
+                if result:
+                    return True, accession, None
+                else:
+                    return False, accession, "Download failed"
+        
+        else:
+            return False, accession, f"Database {database} not in sources {sources}"
+            
+    except Exception as e:
+        return False, accession, str(e)
+
+
+def download_genomes_parallel(records: List[Dict[str, Any]], output_dir: str, sources: List[str], max_workers: int = 4) -> List[str]:
+    """Download multiple genomes in parallel"""
+    logging.info(f"Starting parallel download of {len(records)} genomes with {max_workers} workers...")
+    
+    successful = []
+    failed = []
+    start_time = time.time()
+    
+    # Prepare download tasks
+    download_tasks = []
+    for record in records:
+        accession = record.get('accession', '')
+        database = record.get('database', '').lower()
+        if accession and database:
+            download_tasks.append((accession, database, output_dir, sources))
+    
+    if not download_tasks:
+        logging.warning("No valid accessions found for download")
+        return successful
+    
+    # Execute downloads in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all download tasks
+        future_to_accession = {
+            executor.submit(download_genome_parallel, accession, database, output_dir, sources): accession
+            for accession, database, output_dir, sources in download_tasks
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_accession):
+            accession = future_to_accession[future]
+            try:
+                success, final_accession, error = future.result(timeout=300)  # 5 minute timeout per download
+                if success:
+                    successful.append(final_accession)
+                    logging.debug(f"✓ Downloaded: {final_accession}")
+                else:
+                    failed.append(accession)
+                    logging.warning(f"✗ Failed: {accession} - {error}")
+            except Exception as e:
+                failed.append(accession)
+                logging.error(f"✗ Exception downloading {accession}: {e}")
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    logging.info(f"Parallel download completed in {total_time:.2f} seconds")
+    logging.info(f"✓ Successfully downloaded: {len(successful)}/{len(download_tasks)} genomes")
+    logging.info(f"✗ Failed downloads: {len(failed)}/{len(download_tasks)} genomes")
+    if successful:
+        logging.info(f"⚡ Average speed: {total_time/len(successful):.2f} seconds per genome")
+    
+    return successful
 
 
 def main():
@@ -60,6 +189,8 @@ Examples:
                        help='Download FASTA sequences for found genomes')
     parser.add_argument('--download_only', action='store_true',
                        help='Only download FASTA sequences (skip metadata extraction)')
+    parser.add_argument('--parallel_downloads', type=int, default=4,
+                       help='Number of parallel download workers (default: 4, max: 8)')
     parser.add_argument('--metadata_format', choices=['json', 'csv'], default='json',
                         help='Format for metadata output (default: json)')
     parser.add_argument('--min_quality_score', type=int, default=0,
@@ -84,6 +215,10 @@ Examples:
     if not args.query and not args.download_only:
         parser.error("Either --query or --download_only must be provided")
 
+    # Validate parallel downloads argument
+    if args.parallel_downloads < 1 or args.parallel_downloads > 8:
+        parser.error("--parallel_downloads must be between 1 and 8")
+
     # Determine which sources to search
     if args.source == 'all':
         sources = ['ncbi', 'bvbrc', 'enterobase', 'patric']
@@ -99,57 +234,23 @@ Examples:
                 parser.error("--query must be provided with --download_only (genome IDs/accessions)")
 
             genome_ids = args.query.split(',')
-            logging.info(f"Downloading {len(genome_ids)} genomes from {args.source.upper()}...")
+            logging.info(f"Downloading {len(genome_ids)} genomes from {args.source.upper()} using {args.parallel_downloads} parallel workers...")
 
-            successful = []
+            # Convert genome IDs to records format for parallel download
+            download_records = []
             for genome_id in genome_ids:
                 genome_id = genome_id.strip()
-                # Try to download from available sources
+                # For download-only mode, we'll try the first available source
                 for source in sources:
-                    if source == 'ncbi':
-                        client = NCBIClient()
-                        result = client.download_fasta(genome_id, args.output_dir)
-                        if isinstance(result, tuple) and len(result) == 2:
-                            success, accession = result
-                            if success:
-                                successful.append(accession)
-                                break  # Found it, no need to try other sources
-                        else:
-                            if result:
-                                successful.append(genome_id)
-                                break
-                    elif source == 'bvbrc':
-                        client = BVBRCClient()
-                        result = client.download_fasta(genome_id, args.output_dir)
-                        if isinstance(result, tuple) and len(result) == 2:
-                            success, accession = result
-                            if success:
-                                successful.append(accession)
-                                break
-                        else:
-                            if result:
-                                successful.append(genome_id)
-                                break
-                    elif source == 'enterobase':
-                        from clients.enterobase_client import EnteroBaseClient
-                        client = EnteroBaseClient()
-                        result = client.download_fasta(genome_id, args.output_dir)
-                        if isinstance(result, tuple) and len(result) == 2:
-                            success, accession = result
-                            if success:
-                                successful.append(accession)
-                                break
-                    elif source == 'patric':
-                        from clients.patric_client import PATRICClient
-                        client = PATRICClient()
-                        result = client.download_fasta(genome_id, args.output_dir)
-                        if isinstance(result, tuple) and len(result) == 2:
-                            success, accession = result
-                            if success:
-                                successful.append(accession)
-                                break
+                    download_records.append({
+                        'accession': genome_id,
+                        'database': source.upper()
+                    })
+                    break  # Only try the first source for each genome
 
-            logging.info(f"Downloaded {len(successful)} genomes successfully")
+            # Use parallel download
+            successful = download_genomes_parallel(download_records, args.output_dir, sources, args.parallel_downloads)
+            logging.info(f"Parallel download completed: {len(successful)} genomes successfully downloaded")
 
         else:
             # Search and retrieve mode
@@ -253,51 +354,11 @@ Examples:
 
             # Download FASTA sequences if requested
             if args.download:
-                logging.info("Downloading FASTA sequences for quality-filtered genomes...")
-                successful = []
-
-                for record in all_harmonized_records:
-                    accession = record.get('accession', '')
-                    database = record.get('database', '').lower()
-                    if accession and database in sources:
-                        if database == 'ncbi':
-                            client = NCBIClient()
-                            result = client.download_fasta(accession, args.output_dir)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                success, final_accession = result
-                                if success:
-                                    successful.append(final_accession)
-                            else:
-                                if result:
-                                    successful.append(accession)
-                        elif database == 'bvbrc':
-                            client = BVBRCClient()
-                            result = client.download_fasta(accession, args.output_dir)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                success, final_accession = result
-                                if success:
-                                    successful.append(final_accession)
-                            else:
-                                if result:
-                                    successful.append(accession)
-                        elif database == 'enterobase':
-                            from clients.enterobase_client import EnteroBaseClient
-                            client = EnteroBaseClient()
-                            result = client.download_fasta(accession, args.output_dir)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                success, final_accession = result
-                                if success:
-                                    successful.append(final_accession)
-                        elif database == 'patric':
-                            from clients.patric_client import PATRICClient
-                            client = PATRICClient()
-                            result = client.download_fasta(accession, args.output_dir)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                success, final_accession = result
-                                if success:
-                                    successful.append(final_accession)
-
-                logging.info(f"Downloaded {len(successful)} high-quality FASTA sequences")
+                logging.info(f"Downloading FASTA sequences for quality-filtered genomes using {args.parallel_downloads} parallel workers...")
+                
+                # Use parallel download for all quality-filtered genomes
+                successful = download_genomes_parallel(all_harmonized_records, args.output_dir, sources, args.parallel_downloads)
+                logging.info(f"Parallel download completed: {len(successful)} high-quality FASTA sequences downloaded")
 
             # Print summary
             print_summary(all_harmonized_records, args.source)
@@ -308,13 +369,17 @@ Examples:
 
 
 def save_metadata_to_csv(records: List[Dict[str, Any]], output_file: str):
-    """Save metadata to CSV format"""
+    """Save metadata to CSV format with enhanced field handling"""
     import csv
 
+    # Debug: log what we're receiving
+    logging.info(f"CSV save called with {len(records)} records")
+    
     if not records:
+        logging.warning("No records provided to CSV save function")
         return
 
-    # Flatten nested structures for CSV
+    # Flatten nested structures for CSV with enhanced field handling
     flattened_data = []
     for item in records:
         flat_item = {}
@@ -322,17 +387,78 @@ def save_metadata_to_csv(records: List[Dict[str, Any]], output_file: str):
             if isinstance(value, list):
                 if key == 'amr_phenotypes':
                     flat_item[key] = '; '.join(value) if value else ''
+                elif key == 'mic_data':
+                    # Format MIC data as readable strings
+                    mic_strings = []
+                    for mic in value:
+                        if isinstance(mic, dict):
+                            antibiotic = mic.get('antibiotic', 'Unknown')
+                            mic_value = mic.get('mic_value', 'Unknown')
+                            mic_strings.append(f"{antibiotic}: {mic_value}")
+                        else:
+                            mic_strings.append(str(mic))
+                    flat_item[key] = '; '.join(mic_strings) if mic_strings else ''
+                elif key == 'antibiotic_resistance':
+                    # Format resistance data
+                    resistance_strings = []
+                    for res in value:
+                        if isinstance(res, dict):
+                            antibiotic = res.get('antibiotic', 'Unknown')
+                            resistance = res.get('resistance', 'Unknown')
+                            resistance_strings.append(f"{antibiotic}: {resistance}")
+                        else:
+                            resistance_strings.append(str(res))
+                    flat_item[key] = '; '.join(resistance_strings) if resistance_strings else ''
                 else:
-                    flat_item[key] = str(value)
+                    # Convert other lists to semicolon-separated strings
+                    flat_item[key] = '; '.join(str(v) for v in value) if value else ''
+            elif isinstance(value, dict):
+                # Flatten dictionaries with key_subkey naming
+                for subkey, subvalue in value.items():
+                    flat_item[f"{key}_{subkey}"] = str(subvalue) if subvalue is not None else ''
             else:
-                flat_item[key] = value
+                # Handle regular values, ensuring None becomes empty string
+                flat_item[key] = str(value) if value is not None else ''
         flattened_data.append(flat_item)
 
-    fieldnames = flattened_data[0].keys() if flattened_data else []
+    # Debug: log flattening results
+    logging.info(f"Flattened {len(records)} records into {len(flattened_data)} flat records")
+    if flattened_data:
+        logging.info(f"First flattened record has {len(flattened_data[0])} fields")
+
+    # Ensure consistent field ordering for better CSV readability
+    if flattened_data:
+        # Define preferred field order
+        priority_fields = [
+            'accession', 'organism', 'strain', 'title', 'biosample', 'bioproject',
+            'collection_date', 'country', 'host', 'isolation_source',
+            'amr_phenotypes', 'mic_data', 'antibiotic_resistance',
+            'quality_score', 'database', 'genome_id'
+        ]
+        
+        # Get all available fields
+        all_fields = set()
+        for item in flattened_data:
+            all_fields.update(item.keys())
+        
+        # Order fields: priority first, then alphabetical for the rest
+        fieldnames = []
+        for field in priority_fields:
+            if field in all_fields:
+                fieldnames.append(field)
+                all_fields.remove(field)
+        
+        # Add remaining fields alphabetically
+        fieldnames.extend(sorted(all_fields))
+    else:
+        fieldnames = []
+
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(flattened_data)
+
+    logging.info(f"CSV metadata saved with {len(fieldnames)} columns and {len(flattened_data)} rows")
 
 
 def print_summary(records: List[Dict[str, Any]], source: str):

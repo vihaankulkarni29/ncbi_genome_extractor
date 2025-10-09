@@ -2,7 +2,7 @@
 
 # NCBI Entrez API settings
 NCBI_EMAIL = "vihaankulkarni29@gmail.com"
-NCBI_API_KEY = "ef7622c2e716fa317fe04d24c42904211107"
+NCBI_API_KEY = "0a4a31f50b826e949816d1ba53c684546608"
 
 # Default settings
 DEFAULT_MAX_RESULTS = 100

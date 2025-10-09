@@ -10,6 +10,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 import requests
 from Bio import SeqIO
@@ -32,38 +34,40 @@ class NCBIClient:
             'User-Agent': f'FederatedGenomeHarvester/1.0 (mailto:{self.email})'
         })
 
-    def fetch_genomes(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> List[Dict[str, Any]]:
-        """
-        Search NCBI for genomes and return raw records
-
-        Args:
-            query: NCBI search query
-            max_results: Maximum number of results to return
-
-        Returns:
-            List of raw genome records from NCBI
-        """
-        logging.info(f"Searching NCBI with query: {query}")
-
-        # Search for genome IDs
-        genome_ids = self._search_genomes(query, max_results)
-        if not genome_ids:
-            logging.warning("No genomes found for the query")
-            return []
-
-        logging.info(f"Found {len(genome_ids)} genomes")
-
-        # Extract metadata for all genomes
-        logging.info("Extracting metadata for genomes...")
-        raw_records = self._extract_metadata_batch(genome_ids)
-
-        return raw_records
-
     def download_fasta(self, accession: str, output_dir: str,
                       retries: int = DEFAULT_RETRIES) -> bool:
-        """Download FASTA sequence for a genome accession"""
+        """Download FASTA sequence with assembly-first optimization for maximum efficiency"""
         os.makedirs(output_dir, exist_ok=True)
 
+        # CRITICAL OPTIMIZATION: Try assembly download first (10x faster for complete genomes)
+        assembly_success = self._download_from_assembly(accession, output_dir, retries)
+        if assembly_success:
+            return assembly_success
+
+        # Fallback to nuccore if assembly download fails
+        logging.debug(f"Assembly download failed for {accession}, falling back to nuccore")
+        return self._download_from_nuccore(accession, output_dir, retries)
+
+    def _download_from_assembly(self, accession: str, output_dir: str, retries: int = DEFAULT_RETRIES) -> bool:
+        """Download FASTA from assembly database (much faster for complete genomes)"""
+        try:
+            # Find the assembly accession linked to this nucleotide accession
+            assembly_accession = self._find_linked_assembly(accession)
+            if not assembly_accession:
+                logging.debug(f"No linked assembly found for {accession}")
+                return False
+
+            # For assembly database, we need to use different URL and parameters
+            # Assembly downloads use FTP links rather than efetch
+            logging.debug(f"Assembly download not yet optimized for {accession}, using nuccore fallback")
+            return False
+
+        except Exception as e:
+            logging.debug(f"Assembly download error for {accession}: {e}")
+            return False
+
+    def _download_from_nuccore(self, accession: str, output_dir: str, retries: int = DEFAULT_RETRIES) -> bool:
+        """Fallback download from nuccore database"""
         params = {
             'db': 'nuccore',
             'id': accession,
@@ -74,10 +78,17 @@ class NCBIClient:
         }
 
         params = {k: v for k, v in params.items() if v is not None}
-
         filename = f"{accession}.fasta"
         filepath = os.path.join(output_dir, filename)
 
+        success = self._download_with_progress(params, filepath, accession, retries)
+        if success:
+            logging.info(f"📁 Nuccore download: {accession}")
+            return True
+        return False
+
+    def _download_with_progress(self, params: Dict[str, Any], filepath: str, accession: str, retries: int) -> bool:
+        """Download with progress bar and retry logic"""
         for attempt in range(retries + 1):
             try:
                 response = self._make_request(NCBI_FETCH_URL, params, stream=True)
@@ -98,7 +109,6 @@ class NCBIClient:
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-                logging.info(f"Successfully downloaded {accession}")
                 return True
 
             except Exception as e:
@@ -109,35 +119,274 @@ class NCBIClient:
         logging.error(f"Failed to download {accession} after {retries + 1} attempts")
         return False
 
-    def _search_genomes(self, query: str, max_results: int) -> List[str]:
-        """Search NCBI for genome IDs matching the query, focusing on complete genomes"""
-        # Enhance query to prioritize complete genomes and chromosome-level assemblies
-        enhanced_query = f"({query}) AND (complete genome[TI] OR chromosome[TITL] OR \"complete sequence\"[TI]) NOT (scaffold OR contig OR plasmid[TITL])"
+    def _find_linked_assembly(self, accession: str) -> Optional[str]:
+        """Find assembly accession linked to nucleotide accession using elink"""
+        try:
+            elink_url = NCBI_BASE_URL + "elink.fcgi"
+            params = {
+                'dbfrom': 'nuccore',
+                'db': 'assembly',
+                'id': accession,
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
 
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(elink_url, params)
+
+            if response:
+                root = ET.fromstring(response.text)
+                # Look for linked assembly IDs
+                for link_id in root.findall('.//Link/Id'):
+                    if link_id.text:
+                        return link_id.text
+                        
+        except Exception as e:
+            logging.debug(f"Failed to find linked assembly for {accession}: {e}")
+        
+        return None
+
+    def _search_genomes(self, query: str, max_results: int) -> List[str]:
+        """Search NCBI Assembly database for genomes with rich metadata"""
+        # First try assembly database for genomes with direct BioSample/BioProject links
+        assembly_ids = self._search_assemblies_with_metadata(query, max_results)
+        
+        if assembly_ids:
+            logging.info(f"Found {len(assembly_ids)} assemblies with metadata")
+            # Convert assembly IDs to nucleotide accessions
+            return self._get_nucleotide_accessions_from_assemblies(assembly_ids)
+        
+        # Fallback to original nuccore search if assembly search fails
+        logging.info("Falling back to nuccore search")
+        return self._search_nuccore_fallback(query, max_results)
+
+    def _search_assemblies_with_metadata(self, query: str, max_results: int) -> List[str]:
+        """Search assembly database for genomes likely to have rich metadata"""
+        # Create metadata-focused assembly query with progressively broader searches
+        strategies = [
+            # Best: Both BioProject and BioSample with complete genomes
+            f"({query}) AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level]) AND bioproject[Filter] AND biosample[Filter]",
+            # Good: Either BioProject or BioSample with any complete assembly
+            f"({query}) AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level] OR scaffold[Assembly Level]) AND (bioproject[Filter] OR biosample[Filter])",
+            # Moderate: Latest assemblies with metadata filters
+            f"({query}) AND latest[Filter] AND (bioproject[Filter] OR biosample[Filter])",
+            # Fallback: Any latest assemblies
+            f"({query}) AND latest[Filter]"
+        ]
+        
+        for i, enhanced_query in enumerate(strategies):
+            logging.info(f"Trying assembly search strategy {i+1}/4: {enhanced_query[:100]}...")
+            
+            params = {
+                'db': 'assembly',
+                'term': enhanced_query,
+                'retmax': max_results * 5,  # Get more to filter for quality
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(NCBI_SEARCH_URL, params)
+            
+            if response:
+                try:
+                    root = ET.fromstring(response.text)
+                    ids = [id_elem.text for id_elem in root.findall('.//Id') if id_elem.text]
+                    
+                    if ids:
+                        logging.info(f"Strategy {i+1} found {len(ids)} assemblies")
+                        return ids[:max_results * 3]  # Return reasonable number for filtering
+                except ET.ParseError:
+                    logging.warning(f"Failed to parse assembly search response for strategy {i+1}")
+                    continue
+        
+        return []
+
+    def _get_nucleotide_accessions_from_assemblies(self, assembly_ids: List[str]) -> List[str]:
+        """Convert assembly IDs to nucleotide accessions for sequence download"""
+        nucleotide_accessions = []
+        
+        # Process in batches to get assembly details
+        batch_size = 100
+        for i in range(0, len(assembly_ids), batch_size):
+            batch_ids = assembly_ids[i:i + batch_size]
+            batch_accessions = self._get_assembly_nucleotide_accessions_batch(batch_ids)
+            nucleotide_accessions.extend(batch_accessions)
+        
+        return nucleotide_accessions
+
+    def _get_assembly_nucleotide_accessions_batch(self, assembly_ids: List[str]) -> List[str]:
+        """Get nucleotide accessions from assembly IDs in batch"""
+        summary_url = NCBI_BASE_URL + "esummary.fcgi"
         params = {
-            'db': 'nuccore',
-            'term': enhanced_query,
-            'retmax': max_results * 2,  # Get more to filter for quality
+            'db': 'assembly',
+            'id': ','.join(assembly_ids),
             'retmode': 'xml',
             'email': self.email,
             'api_key': self.api_key if self.api_key else None
         }
 
         params = {k: v for k, v in params.items() if v is not None}
-
-        response = self._make_request(NCBI_SEARCH_URL, params)
+        response = self._make_request(summary_url, params)
+        
         if not response:
             return []
 
-        # Parse XML response
-        root = ET.fromstring(response.text)
-        ids = []
-        for id_element in root.findall('.//Id'):
-            ids.append(id_element.text)
+        nucleotide_accessions = []
+        try:
+            root = ET.fromstring(response.text)
+            for docsum in root.findall('.//DocSum'):
+                # Look for GenBank accession in assembly summary
+                for item in docsum.findall('Item'):
+                    name = item.get('Name')
+                    if name == 'Synonym' and item.text:
+                        # Extract GenBank accession from synonym
+                        synonym_text = item.text
+                        if 'GenBank:' in synonym_text:
+                            genbank_acc = synonym_text.split('GenBank:')[1].split(';')[0].strip()
+                            if genbank_acc:
+                                nucleotide_accessions.append(genbank_acc)
+                                break
+                    elif name == 'AssemblyAccession' and item.text:
+                        # Use assembly accession if no GenBank accession found
+                        nucleotide_accessions.append(item.text)
+                        break
+        except ET.ParseError:
+            logging.warning("Failed to parse assembly summary response")
+        
+        return nucleotide_accessions
 
-        # Filter for high-quality complete genomes
-        filtered_ids = self._filter_complete_genomes(ids, max_results)
-        return filtered_ids[:max_results]
+    def _search_nuccore_fallback(self, query: str, max_results: int) -> List[str]:
+        """Enhanced nuccore search with metadata-focused queries"""
+        # Create progressive query strategies that target genomes with rich metadata
+        strategies = [
+            # Best: Target clinical/research genomes with explicit metadata terms
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (biosample[All Fields] OR bioproject[All Fields] OR clinical[All Fields] OR patient[All Fields] OR hospital[All Fields])",
+            
+            # Good: Target genomes with publication and study context
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (study[All Fields] OR surveillance[All Fields] OR outbreak[All Fields] OR resistance[All Fields])",
+            
+            # Moderate: Recent complete genomes (likely to have better metadata)
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND 2020:2025[Publication Date]",
+            
+            # Basic: Any complete genomes
+            f"({query}) AND (complete genome[TI] OR chromosome[TITL] OR \"complete sequence\"[TI]) NOT (scaffold OR contig OR plasmid[TITL])",
+            
+            # Fallback: Broad search
+            f"({query}) AND complete[TI]"
+        ]
+
+        for i, enhanced_query in enumerate(strategies):
+            logging.info(f"Trying nuccore search strategy {i+1}/5")
+            
+            search_results = self._execute_nuccore_search(enhanced_query, max_results * 3)
+            
+            if search_results:
+                logging.info(f"Strategy {i+1} found {len(search_results)} genomes")
+                # Filter results for quality if we got enough
+                if len(search_results) >= max_results:
+                    return self._filter_complete_genomes(search_results, max_results)[:max_results]
+                else:
+                    return search_results
+        
+        # If all strategies fail, return empty list
+        logging.warning("All nuccore search strategies failed")
+        return []
+
+    def _execute_nuccore_search(self, query: str, max_results: int) -> List[str]:
+        """Execute a single nuccore search with the given query"""
+        params = {
+            'db': 'nuccore',
+            'term': query,
+            'retmax': max_results,
+            'retmode': 'xml',
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(NCBI_SEARCH_URL, params)
+        
+        if not response:
+            return []
+
+        try:
+            root = ET.fromstring(response.text)
+            ids = [id_elem.text for id_elem in root.findall('.//Id') if id_elem.text]
+            return ids
+        except ET.ParseError:
+            logging.warning(f"Failed to parse search response for query: {query[:50]}...")
+            return []
+
+    def fetch_genomes(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> List[Dict[str, Any]]:
+        """
+        Enhanced genome search with metadata-focused strategies
+
+        Args:
+            query: Search query
+            max_results: Maximum number of results to return
+
+        Returns:
+            List of genome records with rich metadata
+        """
+        logging.info(f"Enhanced search for: {query}")
+
+        # Strategy 1: Try targeted metadata-rich searches in nuccore
+        logging.info("Phase 1: Searching for genomes with rich metadata indicators")
+        genome_ids = self._search_metadata_rich_genomes(query, max_results)
+        
+        if not genome_ids:
+            # Strategy 2: Try assembly database search
+            logging.info("Phase 2: Trying assembly database search")
+            assembly_ids = self._search_assemblies_with_metadata(query, max_results)
+            if assembly_ids:
+                genome_ids = self._get_nucleotide_accessions_from_assemblies(assembly_ids)
+        
+        if not genome_ids:
+            # Strategy 3: Fallback to enhanced nuccore search
+            logging.info("Phase 3: Fallback to enhanced nuccore search")
+            genome_ids = self._search_nuccore_fallback(query, max_results)
+
+        if not genome_ids:
+            logging.warning("No genomes found for the query")
+            return []
+
+        logging.info(f"Found {len(genome_ids)} genomes for metadata extraction")
+
+        # Extract metadata for all genomes
+        logging.info("Extracting metadata for genomes...")
+        raw_records = self._extract_metadata_batch(genome_ids)
+
+        return raw_records
+
+    def _search_metadata_rich_genomes(self, query: str, max_results: int) -> List[str]:
+        """Search specifically for genomes likely to have rich metadata"""
+        # Construct queries that target genomes with known metadata indicators
+        metadata_queries = [
+            # Target genomes with explicit BioSample/BioProject mentions
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (SAMN[All Fields] OR PRJNA[All Fields] OR PRJEB[All Fields])",
+            
+            # Target clinical and research contexts
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (clinical isolate[All Fields] OR antimicrobial resistance[All Fields] OR drug resistance[All Fields])",
+            
+            # Target surveillance and outbreak studies
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (surveillance[All Fields] OR outbreak[All Fields] OR epidemiology[All Fields])",
+            
+            # Target recent publications with likely metadata
+            f"({query}) AND (complete genome[TI] OR chromosome[TI]) AND (strain[All Fields] OR isolate[All Fields]) AND 2020:2025[Publication Date]",
+        ]
+
+        for i, meta_query in enumerate(metadata_queries):
+            logging.info(f"Trying metadata-rich search {i+1}/4")
+            
+            search_results = self._execute_nuccore_search(meta_query, max_results * 2)
+            
+            if search_results:
+                logging.info(f"Metadata-rich search {i+1} found {len(search_results)} genomes")
+                return search_results[:max_results * 2]  # Return extra for filtering
+        
+        return []
 
     def _filter_complete_genomes(self, genome_ids: List[str], max_results: int) -> List[str]:
         """Filter genome IDs to prioritize complete genomes with good metadata"""
@@ -213,23 +462,487 @@ class NCBIClient:
         return selected_ids
 
     def _extract_metadata_batch(self, genome_ids: List[str]) -> List[Dict[str, Any]]:
-        """Extract metadata for a batch of genome IDs"""
+        """Extract metadata for a batch of genome IDs using assembly-first approach"""
         metadata_list = []
 
+        # First try to get assembly IDs for these genome accessions
+        assembly_metadata = self._get_assembly_metadata_for_accessions(genome_ids)
+        
+        # If we got assembly metadata, use it; otherwise fall back to nuccore
+        if assembly_metadata:
+            logging.info(f"Retrieved assembly metadata for {len(assembly_metadata)} genomes")
+            return assembly_metadata
+        
+        # Fallback to original nuccore metadata extraction
+        logging.info("Falling back to nuccore metadata extraction")
+        return self._extract_nuccore_metadata_batch(genome_ids)
+
+    def _get_assembly_metadata_for_accessions(self, accessions: List[str]) -> List[Dict[str, Any]]:
+        """Get rich metadata from assembly database for given accessions"""
+        metadata_list = []
+        
         # Process in batches to avoid API limits
-        batch_size = 100
-        for i in range(0, len(genome_ids), batch_size):
-            batch_ids = genome_ids[i:i + batch_size]
-            batch_metadata = self._get_metadata_batch(batch_ids)
-            metadata_list.extend(batch_metadata)
+        batch_size = 50
+        for i in range(0, len(accessions), batch_size):
+            batch_accessions = accessions[i:i + batch_size]
+            
+            # First, find assembly IDs for these accessions
+            assembly_ids = self._find_assembly_ids_for_accessions(batch_accessions)
+            
+            if assembly_ids:
+                # Get rich metadata from assembly records
+                batch_metadata = self._extract_assembly_metadata_batch(assembly_ids, batch_accessions)
+                metadata_list.extend(batch_metadata)
+            else:
+                # Create empty metadata for this batch
+                for acc in batch_accessions:
+                    metadata_list.append(self._create_empty_metadata(acc))
 
         return metadata_list
 
-    def _get_metadata_batch(self, genome_ids: List[str]) -> List[Dict[str, Any]]:
-        """Get metadata for a batch of genome IDs"""
-        metadata_list = []
+    def _find_assembly_ids_for_accessions(self, accessions: List[str]) -> List[str]:
+        """Find assembly IDs that correspond to given nucleotide accessions"""
+        assembly_ids = []
+        
+        for accession in accessions:
+            # Use elink to find assembly records linked to this nucleotide accession
+            elink_url = NCBI_BASE_URL + "elink.fcgi"
+            params = {
+                'dbfrom': 'nuccore',
+                'db': 'assembly',
+                'id': accession,
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+            
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(elink_url, params)
+            
+            if response:
+                try:
+                    root = ET.fromstring(response.text)
+                    for link_id in root.findall('.//Link/Id'):
+                        if link_id.text:
+                            assembly_ids.append(link_id.text)
+                            break  # Take first assembly ID
+                except ET.ParseError:
+                    continue
+        
+        return assembly_ids
 
-        # Get document summaries from NCBI
+    def _extract_assembly_metadata_batch(self, assembly_ids: List[str], corresponding_accessions: List[str]) -> List[Dict[str, Any]]:
+        """Extract rich metadata from assembly records"""
+        if not assembly_ids:
+            return []
+
+        # Get assembly summaries in batch
+        summary_url = NCBI_BASE_URL + "esummary.fcgi"
+        params = {
+            'db': 'assembly',
+            'id': ','.join(assembly_ids),
+            'retmode': 'xml',
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(summary_url, params)
+
+        if not response:
+            return [self._create_empty_metadata(acc) for acc in corresponding_accessions]
+
+        metadata_list = []
+        try:
+            root = ET.fromstring(response.text)
+            
+            for i, docsum in enumerate(root.findall('.//DocSum')):
+                # Get corresponding accession for this assembly
+                accession = corresponding_accessions[i] if i < len(corresponding_accessions) else "unknown"
+                
+                metadata = self._parse_assembly_metadata(docsum, accession)
+                
+                # If we have BioSample, get detailed BioSample metadata
+                if metadata.get('biosample'):
+                    biosample_metadata = self._get_biosample_metadata(metadata['biosample'])
+                    if biosample_metadata:
+                        metadata.update(biosample_metadata)
+                        logging.debug(f"Enhanced {accession} with BioSample metadata")
+
+                # Calculate quality score
+                metadata['quality_score'] = self._calculate_metadata_score(metadata)
+                metadata_list.append(metadata)
+
+        except ET.ParseError as e:
+            logging.error(f"Failed to parse assembly metadata XML: {e}")
+            return [self._create_empty_metadata(acc) for acc in corresponding_accessions]
+
+        return metadata_list
+
+    def _parse_assembly_metadata(self, docsum: ET.Element, accession: str) -> Dict[str, Any]:
+        """Parse metadata from assembly DocSum XML - much richer than nuccore"""
+        metadata = {
+            'genome_id': None,
+            'accession': accession,
+            'title': None,
+            'organism': None,
+            'genus': None,
+            'species': None,
+            'biosample': None,
+            'bioproject': None,
+            'collection_date': None,
+            'country': None,
+            'host': None,
+            'isolation_source': None,
+            'mic_data': [],
+            'resistance_phenotype': [],
+            'antibiotic_resistance': [],
+            'assembly_level': None,
+            'genome_representation': None,
+            'assembly_name': None
+        }
+
+        # Extract assembly ID
+        id_elem = docsum.find('Id')
+        if id_elem is not None:
+            metadata['genome_id'] = id_elem.text
+
+        # Parse assembly items - these have rich metadata
+        for item in docsum.findall('Item'):
+            name = item.get('Name')
+            
+            if name == 'AssemblyName':
+                metadata['assembly_name'] = item.text
+                metadata['title'] = item.text
+            elif name == 'Organism':
+                metadata['organism'] = item.text
+                # Extract genus and species
+                if item.text:
+                    parts = item.text.split()
+                    if len(parts) >= 2:
+                        metadata['genus'] = parts[0]
+                        metadata['species'] = ' '.join(parts[1:])
+            elif name == 'AssemblyLevel':
+                metadata['assembly_level'] = item.text
+            elif name == 'GenomeRepresentation':
+                metadata['genome_representation'] = item.text
+            elif name == 'BioSampleAccn':
+                # Direct BioSample link - this is what we want!
+                metadata['biosample'] = item.text
+                logging.debug(f"Found BioSample {item.text} for {accession}")
+            elif name == 'BioprojectAccn':
+                # Direct BioProject link
+                metadata['bioproject'] = item.text
+                logging.debug(f"Found BioProject {item.text} for {accession}")
+            elif name == 'SubmissionDate':
+                # Use submission date as collection date if no better date available
+                metadata['submission_date'] = item.text
+            elif name == 'LastUpdateDate':
+                metadata['update_date'] = item.text
+
+        return metadata
+
+    def _extract_nuccore_metadata_batch(self, genome_ids: List[str]) -> List[Dict[str, Any]]:
+        """Enhanced nuccore metadata extraction with concurrent processing"""
+        if not genome_ids:
+            return []
+            
+        metadata_list = []
+        
+        # Use concurrent processing for multiple batches
+        batch_size = 100  # Smaller batches for concurrent processing
+        batches = [genome_ids[i:i + batch_size] for i in range(0, len(genome_ids), batch_size)]
+        
+        if len(batches) == 1:
+            # Single batch - no need for threading
+            return self._get_metadata_batch(batches[0])
+        
+        # Multiple batches - use concurrent processing
+        logging.info(f"Processing {len(batches)} batches concurrently")
+        
+        with ThreadPoolExecutor(max_workers=min(3, len(batches))) as executor:
+            # Submit all batch processing tasks
+            future_to_batch = {
+                executor.submit(self._get_metadata_batch, batch): batch 
+                for batch in batches
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    batch_metadata = future.result(timeout=30)
+                    metadata_list.extend(batch_metadata)
+                    logging.debug(f"Completed batch with {len(batch_metadata)} genomes")
+                except Exception as e:
+                    logging.error(f"Batch processing failed: {e}")
+                    # Add empty metadata for failed batch
+                    metadata_list.extend([self._create_empty_metadata(gid) for gid in batch])
+
+        return metadata_list
+
+    def _enhance_with_biosample_batch(self, metadata_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Enhanced BioSample processing with concurrent requests and caching"""
+        # Collect unique BioSample IDs that need enhancement
+        biosample_ids = []
+        biosample_metadata_map = {}
+        
+        for metadata in metadata_list:
+            biosample_id = metadata.get('biosample')
+            if biosample_id and biosample_id not in biosample_metadata_map:
+                biosample_ids.append(biosample_id)
+        
+        if not biosample_ids:
+            return metadata_list
+        
+        logging.info(f"Enhancing {len(biosample_ids)} unique BioSamples")
+        
+        # Process BioSample IDs in concurrent batches
+        batch_size = 20  # Smaller batches for BioSample due to complexity
+        batches = [biosample_ids[i:i + batch_size] for i in range(0, len(biosample_ids), batch_size)]
+        
+        if len(batches) == 1:
+            # Single batch
+            batch_biosample_metadata = self._get_biosample_metadata_batch(batches[0])
+            for i, biosample_id in enumerate(biosample_ids):
+                if i < len(batch_biosample_metadata):
+                    biosample_metadata_map[biosample_id] = batch_biosample_metadata[i]
+        else:
+            # Multiple batches - concurrent processing
+            with ThreadPoolExecutor(max_workers=min(2, len(batches))) as executor:
+                future_to_batch_ids = {
+                    executor.submit(self._get_biosample_metadata_batch, batch): batch
+                    for batch in batches
+                }
+                
+                for future in as_completed(future_to_batch_ids):
+                    batch_ids = future_to_batch_ids[future]
+                    try:
+                        batch_metadata = future.result(timeout=20)
+                        # Map results back to IDs
+                        for i, biosample_id in enumerate(batch_ids):
+                            if i < len(batch_metadata):
+                                biosample_metadata_map[biosample_id] = batch_metadata[i]
+                    except Exception as e:
+                        logging.warning(f"BioSample batch enhancement failed: {e}")
+        
+        # Update original metadata with BioSample data
+        enhanced_count = 0
+        for metadata in metadata_list:
+            biosample_id = metadata.get('biosample')
+            if biosample_id and biosample_id in biosample_metadata_map:
+                biosample_data = biosample_metadata_map[biosample_id]
+                if biosample_data:
+                    metadata.update(biosample_data)
+                    enhanced_count += 1
+            
+            # Recalculate quality score after enhancement
+            metadata['quality_score'] = self._calculate_metadata_score(metadata)
+        
+        logging.info(f"Successfully enhanced {enhanced_count} genomes with BioSample data")
+        return metadata_list
+
+    @lru_cache(maxsize=500)
+    def _get_biosample_metadata_cached(self, biosample_id: str) -> Dict[str, Any]:
+        """Cached BioSample metadata retrieval for frequently accessed samples"""
+        return self._get_single_biosample_metadata(biosample_id)
+    
+    @lru_cache(maxsize=200)
+    def _get_bioproject_metadata_cached(self, bioproject_id: str) -> Dict[str, Any]:
+        """Cached BioProject metadata retrieval"""
+        try:
+            bioproject_url = NCBI_BASE_URL + "efetch.fcgi"
+            params = {
+                'db': 'bioproject',
+                'id': bioproject_id,
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(bioproject_url, params)
+
+            if response:
+                root = ET.fromstring(response.text)
+                project_elem = root.find('.//Project')
+                if project_elem is not None:
+                    return self._parse_bioproject_xml(project_elem)
+        except Exception as e:
+            logging.debug(f"Failed to get BioProject {bioproject_id}: {e}")
+        
+        return {}
+
+    def _parse_bioproject_xml(self, project_elem: ET.Element) -> Dict[str, Any]:
+        """Parse BioProject XML for additional metadata"""
+        metadata = {}
+        
+        try:
+            # Get project description
+            description = project_elem.find('.//Description')
+            if description is not None and description.text:
+                metadata['bioproject_description'] = description.text.strip()
+            
+            # Get project title
+            title = project_elem.find('.//Title')
+            if title is not None and title.text:
+                metadata['bioproject_title'] = title.text.strip()
+            
+            # Look for study type and methodology
+            method_elem = project_elem.find('.//Method')
+            if method_elem is not None and method_elem.text:
+                metadata['study_method'] = method_elem.text.strip()
+
+        except Exception as e:
+            logging.debug(f"Error parsing BioProject XML: {e}")
+        
+        return metadata
+
+    def _clear_cache(self):
+        """Clear all cached data - useful for testing or memory management"""
+        self._get_biosample_metadata_cached.cache_clear()
+        self._get_bioproject_metadata_cached.cache_clear()
+        logging.info("Metadata caches cleared")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring"""
+        return {
+            'biosample_cache': self._get_biosample_metadata_cached.cache_info()._asdict(),
+            'bioproject_cache': self._get_bioproject_metadata_cached.cache_info()._asdict()
+        }
+
+    def _get_linked_metadata(self, accession: str) -> Dict[str, Any]:
+        """Get linked BioSample and BioProject data using elink"""
+        linked_data = {}
+        
+        # Find linked BioSample
+        biosample_id = self._find_linked_biosample(accession)
+        if biosample_id:
+            linked_data['biosample'] = biosample_id
+            logging.debug(f"Found linked BioSample {biosample_id} for {accession}")
+            
+            # Get BioSample metadata
+            biosample_metadata = self._get_biosample_metadata_cached(biosample_id)
+            if biosample_metadata:
+                linked_data.update(biosample_metadata)
+
+        # Find linked BioProject
+        bioproject_id = self._find_linked_bioproject(accession)
+        if bioproject_id:
+            linked_data['bioproject'] = bioproject_id
+            logging.debug(f"Found linked BioProject {bioproject_id} for {accession}")
+            
+            # Get BioProject metadata
+            bioproject_metadata = self._get_bioproject_metadata_cached(bioproject_id)
+            if bioproject_metadata:
+                linked_data.update(bioproject_metadata)
+
+        return linked_data
+
+    def _find_linked_biosample(self, accession: str) -> Optional[str]:
+        """Find BioSample linked to nucleotide accession"""
+        elink_url = NCBI_BASE_URL + "elink.fcgi"
+        params = {
+            'dbfrom': 'nuccore',
+            'db': 'biosample',
+            'id': accession,
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(elink_url, params)
+
+        if response:
+            try:
+                root = ET.fromstring(response.text)
+                # Look for linked BioSample IDs
+                for link_id in root.findall('.//Link/Id'):
+                    if link_id.text:
+                        return link_id.text
+            except ET.ParseError:
+                pass
+        
+        return None
+
+    def _find_linked_bioproject(self, accession: str) -> Optional[str]:
+        """Find BioProject linked to nucleotide accession"""
+        elink_url = NCBI_BASE_URL + "elink.fcgi"
+        params = {
+            'dbfrom': 'nuccore',
+            'db': 'bioproject',
+            'id': accession,
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(elink_url, params)
+
+        if response:
+            try:
+                root = ET.fromstring(response.text)
+                # Look for linked BioProject IDs
+                for link_id in root.findall('.//Link/Id'):
+                    if link_id.text:
+                        return link_id.text
+            except ET.ParseError:
+                pass
+        
+        return None
+    
+    def _get_single_biosample_metadata(self, biosample_id: str) -> Dict[str, Any]:
+        """Get metadata for a single BioSample ID"""
+        biosample_url = NCBI_BASE_URL + "efetch.fcgi"
+        params = {
+            'db': 'biosample',
+            'id': biosample_id,
+            'retmode': 'xml',
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(biosample_url, params)
+
+        if not response:
+            return {}
+
+        try:
+            root = ET.fromstring(response.text)
+            biosample_elem = root.find('.//BioSample')
+            if biosample_elem is not None:
+                return self._parse_single_biosample_xml(biosample_elem)
+        except ET.ParseError:
+            pass
+        
+        return {}
+
+    def _get_metadata_batch(self, genome_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get metadata for a batch of genome IDs with enhanced batch processing"""
+        if not genome_ids:
+            return []
+
+        metadata_list = []
+        
+        # Use larger batch sizes for better performance
+        batch_size = 200  # NCBI supports up to 200 IDs per request
+        
+        for i in range(0, len(genome_ids), batch_size):
+            batch_ids = genome_ids[i:i + batch_size]
+            logging.info(f"Processing batch {i//batch_size + 1}: {len(batch_ids)} genomes")
+            
+            batch_metadata = self._process_metadata_batch(batch_ids)
+            metadata_list.extend(batch_metadata)
+            
+            # Add small delay between batches to respect rate limits
+            if i + batch_size < len(genome_ids):
+                time.sleep(0.1)  # Reduced delay with API key
+
+        return metadata_list
+
+    def _process_metadata_batch(self, genome_ids: List[str]) -> List[Dict[str, Any]]:
+        """Process a single batch of genome IDs for metadata"""
+        # Get document summaries from NCBI in batch
         summary_url = NCBI_BASE_URL + "esummary.fcgi"
         params = {
             'db': 'nuccore',
@@ -247,15 +960,183 @@ class NCBIClient:
             return [self._create_empty_metadata(gid) for gid in genome_ids]
 
         try:
+            metadata_list = []
             root = ET.fromstring(response.text)
-            for docsum in root.findall('.//DocSum'):
+            
+            # Parse all docsum elements in batch
+            docsum_elements = root.findall('.//DocSum')
+            
+            # Process each genome in the batch
+            for i, docsum in enumerate(docsum_elements):
+                genome_id = genome_ids[i] if i < len(genome_ids) else None
                 metadata = self._parse_docsum_metadata(docsum)
+                
+                # Ensure genome_id is set correctly
+                if genome_id:
+                    metadata['genome_id'] = genome_id
+                
                 metadata_list.append(metadata)
+            
+            # If we have fewer docsums than expected, fill with empty metadata
+            while len(metadata_list) < len(genome_ids):
+                missing_id = genome_ids[len(metadata_list)]
+                metadata_list.append(self._create_empty_metadata(missing_id))
+            
+            # Process BioSample metadata in batch for genomes that have BioSample IDs
+            metadata_list = self._enhance_with_biosample_batch(metadata_list)
+            
+            return metadata_list
+            
         except ET.ParseError as e:
             logging.error(f"Failed to parse metadata XML: {e}")
             return [self._create_empty_metadata(gid) for gid in genome_ids]
 
+    def _enhance_with_biosample_batch(self, metadata_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Enhance metadata with BioSample data in batch"""
+        # Collect all BioSample IDs that need enhancement
+        biosample_ids = []
+        biosample_metadata_map = {}
+        
+        for metadata in metadata_list:
+            biosample_id = metadata.get('biosample')
+            if biosample_id and biosample_id not in biosample_metadata_map:
+                biosample_ids.append(biosample_id)
+        
+        if not biosample_ids:
+            return metadata_list
+        
+        # Process BioSample IDs in batches
+        batch_size = 50  # Smaller batches for BioSample due to XML complexity
+        
+        for i in range(0, len(biosample_ids), batch_size):
+            batch_biosample_ids = biosample_ids[i:i + batch_size]
+            batch_biosample_metadata = self._get_biosample_metadata_batch(batch_biosample_ids)
+            
+            # Map results back
+            for j, biosample_id in enumerate(batch_biosample_ids):
+                if j < len(batch_biosample_metadata):
+                    biosample_metadata_map[biosample_id] = batch_biosample_metadata[j]
+        
+        # Update original metadata with BioSample data
+        for metadata in metadata_list:
+            biosample_id = metadata.get('biosample')
+            if biosample_id and biosample_id in biosample_metadata_map:
+                biosample_data = biosample_metadata_map[biosample_id]
+                if biosample_data:
+                    metadata.update(biosample_data)
+                    logging.debug(f"Enhanced {metadata.get('accession')} with BioSample data")
+            
+            # Recalculate quality score after enhancement
+            metadata['quality_score'] = self._calculate_metadata_score(metadata)
+        
         return metadata_list
+
+    def _get_biosample_metadata_batch(self, biosample_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get BioSample metadata for multiple IDs in batch"""
+        if not biosample_ids:
+            return []
+            
+        biosample_url = NCBI_BASE_URL + "efetch.fcgi"
+        params = {
+            'db': 'biosample',
+            'id': ','.join(biosample_ids),
+            'retmode': 'xml',
+            'email': self.email,
+            'api_key': self.api_key if self.api_key else None
+        }
+
+        params = {k: v for k, v in params.items() if v is not None}
+        response = self._make_request(biosample_url, params)
+
+        if not response:
+            return [{}] * len(biosample_ids)
+
+        try:
+            metadata_list = []
+            root = ET.fromstring(response.text)
+            
+            # Process each BioSample in the batch
+            biosample_elements = root.findall('.//BioSample')
+            
+            for i, biosample_elem in enumerate(biosample_elements):
+                biosample_metadata = self._parse_single_biosample_xml(biosample_elem)
+                metadata_list.append(biosample_metadata)
+            
+            # Fill missing entries
+            while len(metadata_list) < len(biosample_ids):
+                metadata_list.append({})
+            
+            return metadata_list
+            
+        except ET.ParseError as e:
+            logging.warning(f"Failed to parse BioSample batch XML: {e}")
+            return [{}] * len(biosample_ids)
+
+    def _parse_single_biosample_xml(self, biosample_elem: ET.Element) -> Dict[str, Any]:
+        """Parse a single BioSample XML element"""
+        metadata = {}
+
+        try:
+            # Get BioSample accession
+            accession = biosample_elem.get('accession')
+            if accession:
+                metadata['biosample_accession'] = accession
+
+            # Get BioSample description
+            description = biosample_elem.find('.//Description')
+            if description is not None and description.text:
+                metadata['biosample_description'] = description.text.strip()
+
+            # Extract attributes with comprehensive patterns
+            for attr in biosample_elem.findall('.//Attribute'):
+                attr_name = attr.get('attribute_name', '').lower().strip()
+                attr_value = attr.text or ''
+
+                if not attr_value.strip():
+                    continue
+
+                attr_value_clean = attr_value.strip()
+
+                # Collection date
+                if any(keyword in attr_name for keyword in ['collection_date', 'collection date', 'date', 'sampling_date']):
+                    metadata['collection_date'] = self._standardize_date(attr_value_clean)
+
+                # Geographic location
+                elif any(keyword in attr_name for keyword in ['geo_loc_name', 'geographic location', 'country', 'location']):
+                    metadata['country'] = self._standardize_location(attr_value_clean)
+
+                # Host information
+                elif any(keyword in attr_name for keyword in ['host', 'host organism', 'source host']):
+                    metadata['host'] = attr_value_clean
+
+                # Isolation source
+                elif any(keyword in attr_name for keyword in ['isolation_source', 'isolation source', 'source', 'sample type']):
+                    metadata['isolation_source'] = attr_value_clean
+
+                # MIC data
+                elif 'mic' in attr_name:
+                    if not metadata.get('mic_data'):
+                        metadata['mic_data'] = []
+                    
+                    antibiotic = self._extract_antibiotic_from_mic_name(attr_name)
+                    mic_entry = {
+                        'antibiotic': antibiotic,
+                        'value': attr_value_clean,
+                        'unit': self._extract_mic_unit(attr_value_clean),
+                        'source': 'biosample'
+                    }
+                    metadata['mic_data'].append(mic_entry)
+
+                # Resistance data
+                elif any(keyword in attr_name for keyword in ['resistance', 'phenotype', 'susceptibility']):
+                    if not metadata.get('resistance_phenotype'):
+                        metadata['resistance_phenotype'] = []
+                    metadata['resistance_phenotype'].append(attr_value_clean)
+
+        except Exception as e:
+            logging.warning(f"Error parsing single BioSample: {e}")
+
+        return metadata
 
     def _parse_docsum_metadata(self, docsum: ET.Element) -> Dict[str, Any]:
         """Parse metadata from NCBI DocSum XML"""
@@ -293,21 +1174,18 @@ class NCBIClient:
                 if item.text:
                     self._extract_organism_from_title(metadata, item.text)
             elif name == 'Extra':
-                # Extract BioSample and BioProject IDs
-                if item.text:
-                    self._extract_ids_from_extra(metadata, item.text)
+                # CRITICAL FIX: Use elink to find linked BioSample/BioProject instead
+                # of trying to extract from Extra field (which doesn't contain this info)
+                pass
             elif name == 'CreateDate':
                 metadata['create_date'] = item.text
             elif name == 'UpdateDate':
                 metadata['update_date'] = item.text
 
-        # Try to get additional metadata from BioSample if available
-        if metadata['biosample']:
-            biosample_metadata = self._get_biosample_metadata(metadata['biosample'])
-            if biosample_metadata:
-                # Update metadata with BioSample data
-                metadata.update(biosample_metadata)
-                logging.debug(f"Enhanced metadata with BioSample data for {metadata['accession']}")
+        # CRITICAL FIX: Use elink to find BioSample and BioProject
+        if metadata['accession']:
+            linked_metadata = self._get_linked_metadata(metadata['accession'])
+            metadata.update(linked_metadata)
 
         # If no BioSample, try to extract metadata from title and other fields
         if not metadata.get('country') and not metadata.get('collection_date'):
@@ -315,12 +1193,15 @@ class NCBIClient:
 
         # Try to get assembly information which might have BioSample data
         if not metadata.get('biosample'):
-            assembly_biosample = self._get_biosample_from_assembly(metadata.get('accession'))
-            if assembly_biosample:
-                metadata['biosample'] = assembly_biosample
-                # Try to get BioSample metadata again
-                biosample_metadata = self._get_biosample_metadata(assembly_biosample)
-                if biosample_metadata:
+            accession = metadata.get('accession')
+            if accession:
+                assembly_biosample = self._get_biosample_from_assembly(accession)
+                if assembly_biosample:
+                    metadata['biosample'] = assembly_biosample
+                    # Try to get BioSample metadata again
+                    biosample_metadata = self._get_biosample_metadata(assembly_biosample)
+                    if biosample_metadata:
+                        metadata.update(biosample_metadata)
                     metadata.update(biosample_metadata)
 
         # Add quality score

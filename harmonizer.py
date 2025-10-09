@@ -40,19 +40,50 @@ def harmonize_data(raw_records: List[Dict[str, Any]], source: str) -> List[Dict[
 
 
 def _harmonize_ncbi_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Harmonize NCBI record to standard schema"""
+    """Harmonize NCBI record to standard schema with enhanced metadata preservation"""
     harmonized = {
+        # Core identifiers
         'accession': record.get('accession', ''),
+        'genome_id': record.get('genome_id', ''),
+        'title': record.get('title', ''),
+        
+        # Organism information
         'organism': record.get('organism', ''),
+        'genus': record.get('genus', ''),
+        'species': record.get('species', ''),
         'strain': _extract_strain_from_title(record.get('title', '')),
+        
+        # Temporal and geographic data
         'collection_date': record.get('collection_date', ''),
         'country': record.get('country', ''),
+        'create_date': record.get('create_date', ''),
+        'update_date': record.get('update_date', ''),
+        
+        # Sample and study metadata
         'host': record.get('host', ''),
         'isolation_source': record.get('isolation_source', ''),
-        'amr_phenotypes': _extract_amr_phenotypes(record)
+        'biosample': record.get('biosample', ''),
+        'biosample_accession': record.get('biosample_accession', ''),
+        'biosample_description': record.get('biosample_description', ''),
+        'bioproject': record.get('bioproject', ''),
+        'bioproject_title': record.get('bioproject_title', ''),
+        'bioproject_description': record.get('bioproject_description', ''),
+        'study_method': record.get('study_method', ''),
+        
+        # Quality and resistance data
+        'quality_score': record.get('quality_score', 0),
+        'amr_phenotypes': _extract_amr_phenotypes(record),
+        'mic_data': record.get('mic_data', []),
+        'resistance_phenotype': record.get('resistance_phenotype', []),
+        'antibiotic_resistance': record.get('antibiotic_resistance', []),
+        
+        # Additional metadata
+        'length': record.get('length', ''),
+        'gi': record.get('gi', ''),
+        'sra_accession': record.get('sra_accession', '')
     }
 
-    # Clean up empty strings
+    # Clean up empty strings but preserve meaningful data
     for key, value in harmonized.items():
         if isinstance(value, str) and not value.strip():
             harmonized[key] = None
