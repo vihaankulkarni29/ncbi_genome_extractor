@@ -96,6 +96,7 @@ def download_genomes_parallel(records: List[Dict[str, Any]], output_dir: str, so
     
     successful = []
     failed = []
+    error_details = []
     start_time = time.time()
     
     # Prepare download tasks
@@ -128,21 +129,49 @@ def download_genomes_parallel(records: List[Dict[str, Any]], output_dir: str, so
                     logging.debug(f"✓ Downloaded: {final_accession}")
                 else:
                     failed.append(accession)
+                    error_details.append({
+                        'accession': accession,
+                        'error': error,
+                        'source': 'download',
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    })
                     logging.warning(f"✗ Failed: {accession} - {error}")
             except Exception as e:
                 failed.append(accession)
+                error_details.append({
+                    'accession': accession,
+                    'error': str(e),
+                    'source': 'exception',
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                })
                 logging.error(f"✗ Exception downloading {accession}: {e}")
     
     end_time = time.time()
     total_time = end_time - start_time
-    
+
     logging.info(f"Parallel download completed in {total_time:.2f} seconds")
     logging.info(f"✓ Successfully downloaded: {len(successful)}/{len(download_tasks)} genomes")
     logging.info(f"✗ Failed downloads: {len(failed)}/{len(download_tasks)} genomes")
     if successful:
         logging.info(f"⚡ Average speed: {total_time/len(successful):.2f} seconds per genome")
-    
+
+    # Save error report if there are failures
+    if error_details:
+        error_report_path = os.path.join(output_dir, 'failed_downloads_report.csv')
+        save_error_report_csv(error_details, error_report_path)
+        logging.info(f"Detailed error report saved to {error_report_path}")
+
     return successful
+def save_error_report_csv(error_details: list, output_file: str):
+    """Save error details to a CSV file for post-run analysis"""
+    import csv
+    if not error_details:
+        return
+    fieldnames = ['accession', 'error', 'source', 'timestamp']
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(error_details)
 
 
 def main():
